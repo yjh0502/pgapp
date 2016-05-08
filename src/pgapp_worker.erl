@@ -8,113 +8,55 @@
 -behaviour(gen_server).
 -behaviour(poolboy_worker).
 
--export([squery/1, squery/2, squery/3,
-         equery/2, equery/3, equery/4,
-         with_transaction/2, with_transaction/3]).
+-export([conn/2, equery/4]).
 
 -export([start_link/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
--record(state, {conn::pid(),
-                delay::pos_integer(),
-                timer::timer:tref(),
-                start_args::proplists:proplist()}).
+-include_lib("epgsql/include/epgsql.hrl").
 
 -define(INITIAL_DELAY, 500). % Half a second
 -define(MAXIMUM_DELAY, 5 * 60 * 1000). % Five minutes
 -define(TIMEOUT, 5 * 1000).
 
--define(STATE_VAR, '$pgapp_state').
+-record(state, {
+    conn = undefined :: undefined | pid(),
+    delay = ?INITIAL_DELAY :: pos_integer(),
+    timer = undefined :: undefined | timer:tref(),
+    start_args :: proplists:proplist(),
+    statements = #{} :: map(),
+    option = #{} ::map()
+}).
 
-squery(Sql) ->
-    case get(?STATE_VAR) of
-        undefined ->
-            squery(epgsql_pool, Sql);
-        Conn ->
-            epgsql:squery(Conn, Sql)
-    end.
+conn(W, Timeout) ->
+    gen_server:call(W, conn, Timeout).
 
-squery(PoolName, Sql) when is_atom(PoolName) ->
-    squery(PoolName, Sql, ?TIMEOUT);
-squery(Sql, Timeout) ->
-    squery(epgsql_pool, Sql, Timeout).
-
-squery(PoolName, Sql, Timeout) ->
-    middle_man_transaction(PoolName,
-                           fun (W) ->
-                                   gen_server:call(W, {squery, Sql}, Timeout)
-                           end, Timeout).
-
-equery(Sql, Params) ->
-    case get(?STATE_VAR) of
-        undefined ->
-            equery(epgsql_pool, Sql, Params);
-        Conn ->
-            epgsql:equery(Conn, Sql, Params)
-    end.
-
-equery(PoolName, Sql, Params) when is_atom(PoolName) ->
-    equery(PoolName, Sql, Params, ?TIMEOUT);
-equery(Sql, Params, Timeout) ->
-    equery(epgsql_pool, Sql, Params, Timeout).
-
-equery(PoolName, Sql, Params, Timeout) ->
-    middle_man_transaction(PoolName,
-                           fun (W) ->
-                                   gen_server:call(W, {equery, Sql, Params},
-                                                   Timeout)
-                           end, Timeout).
-
-with_transaction(PoolName, Fun) ->
-    with_transaction(PoolName, Fun, ?TIMEOUT).
-
-with_transaction(PoolName, Fun, Timeout) ->
-    middle_man_transaction(PoolName,
-                           fun (W) ->
-                                   gen_server:call(W, {transaction, Fun},
-                                                   Timeout)
-                           end, Timeout).
-
-middle_man_transaction(Pool, Fun, Timeout) ->
-    Tag = make_ref(),
-    {Receiver, Ref} = erlang:spawn_monitor(
-                        fun() ->
-                                process_flag(trap_exit, true),
-                                Result = poolboy:transaction(Pool, Fun,
-                                                             Timeout),
-                                exit({self(),Tag,Result})
-                        end),
-    receive
-        {'DOWN', Ref, _, _, {Receiver, Tag, Result}} ->
-            Result;
-        {'DOWN', Ref, _, _, {timeout, _}} ->
-            {error, timeout};
-        {'DOWN', Ref, _, _, Reason} ->
-            {error, Reason}
-    end.
+equery(W, Sql, Args, Timeout) ->
+    gen_server:call(W, {equery, Sql, Args}, Timeout).
 
 start_link(Args) ->
     gen_server:start_link(?MODULE, Args, []).
 
 init(Args) ->
     process_flag(trap_exit, true),
-    {ok, connect(#state{start_args = Args, delay = ?INITIAL_DELAY})}.
+    {ok, connect(#state{start_args = Args})}.
 
-handle_call({squery, Sql}, _From,
-            #state{conn=Conn} = State) when Conn /= undefined ->
-    {reply, epgsql:squery(Conn, Sql), State};
-handle_call({equery, Sql, Params}, _From,
-            #state{conn = Conn} = State) when Conn /= undefined ->
-    {reply, epgsql:equery(Conn, Sql, Params), State};
+handle_call(conn, _From, #state{conn=Conn} = State) ->
+    {reply, {ok, Conn}, State};
 
-handle_call({transaction, Fun}, _From,
-            #state{conn = Conn} = State) when Conn /= undefined ->
-    put(?STATE_VAR, Conn),
-    Result = epgsql:with_transaction(Conn, fun(_) -> Fun() end),
-    erase(?STATE_VAR),
-    {reply, Result, State}.
+handle_call({equery, Sql, Args}, _From, State) ->
+    exec_query(Sql, Args, State);
+
+handle_call(Msg, From, #state{conn=Conn} = State) ->
+    try gen_server:call(Conn, Msg, ?TIMEOUT) of
+        Reply -> {reply, Reply, State}
+    catch
+        timeout:_ ->
+            gen_server:reply(From, {error, timeout}),
+            {noreply, connect(State)}
+    end.
 
 handle_cast(reconnect, State) ->
     {noreply, connect(State)}.
@@ -125,7 +67,7 @@ handle_info({'EXIT', From, Reason}, State) ->
             undefined ->
                 %% We add a timer here only if there's not one that's
                 %% already active.
-                Delay = calculate_delay(State#state.delay),
+                Delay = min(State#state.delay*2, ?MAXIMUM_DELAY),
                 {ok, T} =
                     timer:apply_after(
                       State#state.delay,
@@ -138,7 +80,7 @@ handle_info({'EXIT', From, Reason}, State) ->
     error_logger:warning_msg(
       "~p EXIT from ~p: ~p - attempting to reconnect in ~p ms~n",
       [self(), From, Reason, NewDelay]),
-    {noreply, State#state{conn = undefined, delay = NewDelay, timer = Tref}}.
+    {noreply, State#state{conn=undefined, statements=#{}, delay = NewDelay, timer = Tref}}.
 
 terminate(_Reason, #state{conn=Conn}) ->
     ok = epgsql:close(Conn),
@@ -159,9 +101,9 @@ connect(State) ->
               "~p Connected to ~s at ~s with user ~s: ~p~n",
               [self(), Database, Hostname, Username, Conn]),
             timer:cancel(State#state.timer),
-            State#state{conn=Conn, delay=?INITIAL_DELAY, timer = undefined};
+            State#state{conn=Conn, statements=#{}, delay=?INITIAL_DELAY, timer = undefined};
         Error ->
-            NewDelay = calculate_delay(State#state.delay),
+            NewDelay = min(State#state.delay*2, ?MAXIMUM_DELAY),
             error_logger:warning_msg(
               "~p Unable to connect to ~s at ~s with user ~s (~p) "
               "- attempting reconnect in ~p ms~n",
@@ -169,10 +111,41 @@ connect(State) ->
             {ok, Tref} =
                 timer:apply_after(
                   State#state.delay, gen_server, cast, [self(), reconnect]),
-            State#state{conn=undefined, delay = NewDelay, timer = Tref}
+            State#state{conn=undefined, statements=#{}, delay = NewDelay, timer = Tref}
     end.
 
-calculate_delay(Delay) when (Delay * 2) >= ?MAXIMUM_DELAY ->
-    ?MAXIMUM_DELAY;
-calculate_delay(Delay) ->
-    Delay * 2.
+exec_query(Sql, Args, State = #state{statements=StmtMap,conn=Conn}) ->
+    Name = stmt_name(Sql),
+    case cache_prepare(Name, Sql, State) of
+        {ok, Stmt = #statement{types = Types}, NextState} ->
+            TypedArgs = lists:zip(Types, Args),
+            Ref = epgsqla:prepared_query(Conn, Stmt, TypedArgs),
+            receive
+                {Conn, Ref, {error, #error{codename=invalid_sql_statement_name}}} ->
+                    ok = epgsql:close(Conn, Stmt),
+                    exec_query(Sql, Args, State#state{ statements=maps:remove(Name, StmtMap) });
+                {Conn, Ref, {error, #error{codename=feature_not_supported}}} -> % cached plan must not change result type
+                    ok = epgsql:close(Conn, Stmt),
+                    exec_query(Sql, Args, State#state{ statements=maps:remove(Name, StmtMap) });
+                {Conn, Ref, Resp} ->
+                    {reply, Resp, NextState}
+            end;
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end.
+
+cache_prepare(Name, Sql, State = #state{statements=StmtMap, conn=Conn}) ->
+    case maps:get(Name, StmtMap, undefined) of
+        undefined ->
+            case epgsql:parse(Conn, Name, Sql, []) of
+                {ok, Stmt2} ->
+                    {ok, Stmt2, State#state{statements=StmtMap#{ Name => Stmt2 }}};
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        Stmt ->
+            {ok, Stmt, State}
+    end.
+
+stmt_name(Sql) ->
+    integer_to_binary(erlang:phash2(Sql), 36).
