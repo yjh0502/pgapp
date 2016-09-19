@@ -57,6 +57,9 @@ trx(PoolName, Fun, Opts) ->
 with_transaction(Fun, Opts) ->
     with_transaction(?DEFAULT_POOL, Fun, Opts).
 
+with_transaction(PoolName, Fun, Timeout) when is_integer(Timeout) ->
+    % backward compat
+    with_transaction(PoolName, Fun, [{timeout, Timeout}]);
 with_transaction(PoolName, Fun, Opts) ->
     Timeout = proplists:get_value(timeout, Opts, ?TIMEOUT),
     try no_transaction(PoolName, fun(W) ->
