@@ -128,7 +128,9 @@ exec_query(Sql, Args, State = #state{statements=StmtMap,conn=Conn}) ->
                     ok = epgsql:close(Conn, Stmt),
                     exec_query(Sql, Args, State#state{ statements=maps:remove(Name, StmtMap) });
                 {Conn, Ref, Resp} ->
-                    {reply, Resp, NextState}
+                    {reply, Resp, NextState};
+                {'EXIT', _From, _Reason} ->
+                    {reply, {error, #error{codename=crashed, message= <<>>}}, connect(State)}
             end;
         {error, Reason} ->
             {reply, {error, Reason}, State}
