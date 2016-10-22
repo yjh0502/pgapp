@@ -99,7 +99,7 @@ connect(State) ->
         {ok, Conn} ->
             error_logger:info_msg(
               "~p Connected to ~s at ~s with user ~s: ~p~n",
-              [self(), Database, Hostname, Username, Conn]),
+              [self(), Database, host_to_str(Hostname), Username, Conn]),
             timer:cancel(State#state.timer),
             State#state{conn=Conn, statements=#{}, delay=?INITIAL_DELAY, timer = undefined};
         Error ->
@@ -151,3 +151,8 @@ cache_prepare(Name, Sql, State = #state{statements=StmtMap, conn=Conn}) ->
 
 stmt_name(Sql) ->
     integer_to_binary(erlang:phash2(Sql), 36).
+
+host_to_str(Address) when is_tuple(Address) ->
+    inet_parse:ntoa(Address);
+host_to_str(Str) when is_list(Str) ->
+    Str.
